@@ -1,7 +1,7 @@
 name: Terraform CI/CD
 
-# A feature branch runs checks and plan. Merging it into main runs the same
-# checks, then applies the resulting plan to the dev environment.
+# Feature branches run checks and plan. A merge to main creates a fresh plan
+# from the merge commit, then applies that plan to the dev environment.
 on:
   pull_request:
     branches: [main]
