@@ -2,3 +2,7 @@ aws_region          = "ap-southeast-1"
 project_name        = "terraform-aws-lab"
 environment         = "dev"
 state_bucket_name   = "replace-with-a-globally-unique-terraform-state-bucket"
+
+# GitHub immutable IDs. Retrieve them with the command in README section 3.2.
+github_organization_id = "326441999"
+github_repository_id   = "REPLACE_WITH_GITHUB_REPOSITORY_ID"
