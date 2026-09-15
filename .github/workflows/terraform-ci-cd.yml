@@ -133,7 +133,7 @@ jobs:
     needs: plan
     # A feature branch can never apply. Apply occurs only after its changes
     # have been merged and pushed to main.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: ${{ github.event_name == 'push' && github.ref_name == 'main' && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     environment: dev
     env:
