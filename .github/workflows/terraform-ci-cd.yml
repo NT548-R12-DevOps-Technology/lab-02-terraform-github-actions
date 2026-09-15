@@ -1,0 +1,177 @@
+name: Terraform CI/CD
+
+# A feature branch runs checks and plan. Merging it into main runs the same
+# checks, then applies the resulting plan to the dev environment.
+on:
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]
+  push:
+    branches: ["**"]
+    paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for GitHub Actions to request an OIDC token for the AWS IAM role.
+  id-token: write
+
+# Do not run two Terraform deployments against the same state simultaneously.
+concurrency:
+  group: terraform-dev-deployment
+  cancel-in-progress: false
+
+jobs:
+  format:
+    name: Format Terraform
+    # Quality checks run on feature branches and pull requests. The main
+    # branch only recreates the plan and applies it after a reviewed merge.
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+      # Fail when .tf files are not formatted using terraform fmt.
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive terraform
+
+  validate:
+    name: Validate Terraform
+    needs: format
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+      # Validation does not require AWS credentials or the remote state.
+      - name: Initialize Terraform without a remote backend
+        working-directory: terraform/environments/dev
+        run: terraform init -backend=false -input=false
+      - name: Validate Terraform configuration
+        working-directory: terraform/environments/dev
+        run: terraform validate
+
+  scan:
+    name: Scan Terraform with Checkov
+    needs: validate
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Fail this job if Checkov finds an unsuppressed policy violation.
+      - name: Scan Terraform with Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          soft_fail: false
+
+  plan:
+    name: Plan Terraform
+    needs: scan
+    # A feature branch plans only after all checks pass. On main, run a new
+    # plan from the merge commit; it is the exact plan that Apply will use.
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || needs.scan.result == 'success')
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_ami_id: ${{ vars.TF_VAR_AMI_ID }}
+      TF_VAR_allowed_ssh_cidr: ${{ vars.TF_VAR_ALLOWED_SSH_CIDR }}
+      TF_VAR_public_key_path: key_pair/lab_key.pub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+      # The public key is configuration, not a private key; keep it in a
+      # GitHub Secret so it is masked in workflow logs.
+      - name: Create temporary public key file
+        run: |
+          mkdir -p key_pair
+          printf '%s\n' "${{ secrets.LAB_PUBLIC_KEY }}" > key_pair/lab_key.pub
+      - name: Initialize remote Terraform backend
+        working-directory: terraform/environments/dev
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=lab-02/dev/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+      - name: Create Terraform plan
+        working-directory: terraform/environments/dev
+        run: terraform plan -input=false -out=tfplan
+      # Apply uses exactly this reviewed plan, rather than recalculating it.
+      - name: Upload Terraform plan
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-dev-plan
+          path: terraform/environments/dev/tfplan
+          retention-days: 1
+
+  apply:
+    name: Apply Terraform
+    needs: plan
+    # A feature branch can never apply. Apply occurs only after its changes
+    # have been merged and pushed to main.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      AWS_REGION:             ${{ vars.AWS_REGION }}
+      TF_VAR_public_key_path: key_pair/lab_key.pub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+      # Apply runs on a new runner, so recreate the public key file that the
+      # EC2 module reads during configuration evaluation.
+      - name: Create temporary public key file
+        run: |
+          mkdir -p key_pair
+          printf '%s\n' "${{ secrets.LAB_PUBLIC_KEY }}" > key_pair/lab_key.pub
+      # Each job starts on a fresh runner. Initialize again so Terraform
+      # installs the provider package required to apply the saved plan.
+      - name: Initialize remote Terraform backend
+        working-directory: terraform/environments/dev
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=lab-02/dev/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+      - name: Download reviewed Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-dev-plan
+          path: terraform/environments/dev
+      - name: Apply reviewed Terraform plan
+        working-directory: terraform/environments/dev
+        run: terraform apply -input=false tfplan
